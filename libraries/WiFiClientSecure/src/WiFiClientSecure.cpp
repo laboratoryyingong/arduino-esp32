@@ -129,9 +129,13 @@ int WiFiClientSecure::connect(IPAddress ip, uint16_t port, const char *CA_cert, 
 
 int WiFiClientSecure::connect(const char *host, uint16_t port, const char *CA_cert, const char *cert, const char *private_key)
 {
+    // splashme IPv6: do NOT abort when the A-record lookup fails — on
+    // IPv6-only/DNS64 networks the host may only have an AAAA record.
+    // start_ssl_client() resolves the hostname itself via getaddrinfo
+    // (AF_UNSPEC), so just pass the name through with a null IP.
     IPAddress address;
     if (!WiFi.hostByName(host, address))
-        return 0;
+        address = IPAddress((uint32_t)0);
 
     return connect(address, port, host, CA_cert, cert, private_key);
 }

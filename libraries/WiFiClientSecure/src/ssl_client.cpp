@@ -10,6 +10,7 @@
 #include <esp32-hal-log.h>
 #include <lwip/err.h>
 #include <lwip/sockets.h>
+#include <lwip/netdb.h>
 #include <lwip/sys.h>
 #include <lwip/netdb.h>
 #include <mbedtls/sha256.h>
@@ -68,18 +69,18 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
     log_v("Starting socket");
     ssl_client->socket = -1;
 
-    ssl_client->socket = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (ssl_client->socket < 0) {
-        log_e("ERROR opening socket");
-        return ssl_client->socket;
+    // splashme IPv6: resolve and connect via getaddrinfo(AF_UNSPEC) so TLS works
+    // on IPv4-only, IPv6-only and dual-stack networks alike (lwIP's resolver
+    // already falls back A -> AAAA). When the caller passed a pre-resolved IPv4
+    // and no hostname, feed the numeric address through the same path.
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+    char ip4_str[16];
+    const char *node = hostname;
+    if (node == NULL) {
+        snprintf(ip4_str, sizeof(ip4_str), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+        node = ip4_str;
     }
-
-    fcntl( ssl_client->socket, F_SETFL, fcntl( ssl_client->socket, F_GETFL, 0 ) | O_NONBLOCK );
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = ip;
-    serv_addr.sin_port = htons(port);
 
     if(timeout <= 0){
         timeout = 30000; // Milli seconds.
@@ -87,51 +88,83 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
 
     ssl_client->socket_timeout = timeout;
 
-    fd_set fdset;
     struct timeval tv;
-    FD_ZERO(&fdset);
-    FD_SET(ssl_client->socket, &fdset);
     tv.tv_sec = timeout / 1000;
     tv.tv_usec = (timeout % 1000) * 1000;
 
-    int res = lwip_connect(ssl_client->socket, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
-    if (res < 0 && errno != EINPROGRESS) {
-        log_e("connect on fd %d, errno: %d, \"%s\"", ssl_client->socket, errno, strerror(errno));
-        lwip_close(ssl_client->socket);
-        ssl_client->socket = -1;
+    struct addrinfo hints;
+    struct addrinfo *addr_list = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    if (lwip_getaddrinfo(node, port_str, &hints, &addr_list) != 0 || addr_list == NULL) {
+        log_e("getaddrinfo failed for \"%s\"", node);
         return -1;
     }
 
-    res = select(ssl_client->socket + 1, nullptr, &fdset, nullptr, timeout<0 ? nullptr : &tv);
-    if (res < 0) {
-        log_e("select on fd %d, errno: %d, \"%s\"", ssl_client->socket, errno, strerror(errno));
-        lwip_close(ssl_client->socket);
-        ssl_client->socket = -1;
-        return -1;
-    } else if (res == 0) {
-        log_i("select returned due to timeout %d ms for fd %d", timeout, ssl_client->socket);
-        lwip_close(ssl_client->socket);
-        ssl_client->socket = -1;
-        return -1;
-    } else {
-        int sockerr;
-        socklen_t len = (socklen_t)sizeof(int);
-        res = getsockopt(ssl_client->socket, SOL_SOCKET, SO_ERROR, &sockerr, &len);
+    for (struct addrinfo *cur = addr_list; cur != NULL; cur = cur->ai_next) {
+        char addr_str[46] = "?";
+        if (cur->ai_family == AF_INET)
+            inet_ntop(AF_INET, &((struct sockaddr_in *)cur->ai_addr)->sin_addr, addr_str, sizeof(addr_str));
+        else if (cur->ai_family == AF_INET6)
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)cur->ai_addr)->sin6_addr, addr_str, sizeof(addr_str));
+        log_i("[TLS] connecting %s -> %s (%s)", node, addr_str,
+              (cur->ai_family == AF_INET6) ? "IPv6" : "IPv4");
 
+        ssl_client->socket = lwip_socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+        if (ssl_client->socket < 0) {
+            log_e("ERROR opening socket (family %d)", cur->ai_family);
+            continue;
+        }
+
+        fcntl( ssl_client->socket, F_SETFL, fcntl( ssl_client->socket, F_GETFL, 0 ) | O_NONBLOCK );
+
+        fd_set fdset;
+        FD_ZERO(&fdset);
+        FD_SET(ssl_client->socket, &fdset);
+
+        int res = lwip_connect(ssl_client->socket, cur->ai_addr, cur->ai_addrlen);
+        if (res < 0 && errno != EINPROGRESS) {
+            log_e("connect on fd %d, errno: %d, \"%s\"", ssl_client->socket, errno, strerror(errno));
+            lwip_close(ssl_client->socket);
+            ssl_client->socket = -1;
+            continue;
+        }
+
+        res = select(ssl_client->socket + 1, nullptr, &fdset, nullptr, timeout<0 ? nullptr : &tv);
         if (res < 0) {
-            log_e("getsockopt on fd %d, errno: %d, \"%s\"", ssl_client->socket, errno, strerror(errno));
+            log_e("select on fd %d, errno: %d, \"%s\"", ssl_client->socket, errno, strerror(errno));
             lwip_close(ssl_client->socket);
             ssl_client->socket = -1;
-            return -1;
-        }
+            continue;
+        } else if (res == 0) {
+            log_i("select returned due to timeout %d ms for fd %d", timeout, ssl_client->socket);
+            lwip_close(ssl_client->socket);
+            ssl_client->socket = -1;
+            continue;
+        } else {
+            int sockerr;
+            socklen_t len = (socklen_t)sizeof(int);
+            res = getsockopt(ssl_client->socket, SOL_SOCKET, SO_ERROR, &sockerr, &len);
 
-        if (sockerr != 0) {
-            log_e("socket error on fd %d, errno: %d, \"%s\"", ssl_client->socket, sockerr, strerror(sockerr));
-            lwip_close(ssl_client->socket);
-            ssl_client->socket = -1;
-            return -1;
+            if (res < 0 || sockerr != 0) {
+                log_e("socket error on fd %d, errno: %d, \"%s\"", ssl_client->socket, sockerr, strerror(sockerr));
+                lwip_close(ssl_client->socket);
+                ssl_client->socket = -1;
+                continue;
+            }
         }
+        break; // connected
     }
+    lwip_freeaddrinfo(addr_list);
+
+    if (ssl_client->socket < 0) {
+        log_e("connect failed for all resolved addresses of \"%s\"", node);
+        return -1;
+    }
+    log_i("[TLS] TCP connected to %s (fd %d), starting handshake", node, ssl_client->socket);
 
 
 #define ROE(x,msg) { if (((x)<0)) { log_e("LWIP Socket config of " msg " failed."); return -1; }}

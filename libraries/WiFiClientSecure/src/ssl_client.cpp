@@ -303,6 +303,15 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
     unsigned long handshake_start_time=millis();
     while ((ret = mbedtls_ssl_handshake(&ssl_client->ssl_ctx)) != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            // splashme: -9984 (X509 verify failed) is ambiguous - print the
+            // verify flags so field logs distinguish a real certificate issue
+            // (expired / future / not trusted) from an OOM-mapped failure.
+            uint32_t vflags = mbedtls_ssl_get_verify_result(&ssl_client->ssl_ctx);
+            if (vflags != 0) {
+                char vbuf[512];
+                mbedtls_x509_crt_verify_info(vbuf, sizeof(vbuf), "  ! ", vflags);
+                log_e("[TLS] cert verify flags 0x%08X:\n%s", (unsigned)vflags, vbuf);
+            }
             return handle_error(ret);
         }
         if((millis()-handshake_start_time)>ssl_client->handshake_timeout)

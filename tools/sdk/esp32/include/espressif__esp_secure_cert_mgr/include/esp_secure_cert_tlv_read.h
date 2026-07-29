@@ -1,17 +1,54 @@
 /*
- * SPDX-FileCopyrightText: 2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2022-2025 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
+#include <stdbool.h>
 #include "esp_err.h"
 
-#include "esp_secure_cert_tlv_config.h"
+/* Check IDF version for write support (requires >= 5.3) */
+#if __has_include("esp_idf_version.h")
+    #include "esp_idf_version.h"
+    #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+        #define ESP_SECURE_CERT_WRITE_SUPPORT 1
+    #endif
+#endif
 
+/* Include atomic support only when write support is available */
+#ifdef ESP_SECURE_CERT_WRITE_SUPPORT
+    #ifdef __cplusplus
+        #include <atomic>
+        using atomic_bool = std::atomic<bool>;
+    #else
+        #include <stdatomic.h>
+    #endif // __cplusplus
+#endif // ESP_SECURE_CERT_WRITE_SUPPORT
+
+#include "esp_partition.h"
+#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#include "spi_flash_mmap.h"
+#endif
+
+#include "esp_secure_cert_tlv_config.h"
+#include "esp_partition.h"
 #ifdef __cplusplus
 extern "C"
 {
 #endif
+
+/*
+ * Context structure to hold the partition information
+ * and memory mapped address for esp_secure_cert partition
+ */
+typedef struct esp_secure_cert_partition_ctx {
+    const esp_partition_t *partition;           /* Pointer to the esp_secure_cert partition */
+    const void *esp_secure_cert_mapped_addr;    /* Memory mapped address of the partition */
+    spi_flash_mmap_handle_t handle;             /* Memory map handle */
+#ifdef ESP_SECURE_CERT_WRITE_SUPPORT
+    atomic_bool write_lock;                     /* Atomic lock for write operations (1 byte) */
+#endif
+} esp_secure_cert_partition_ctx_t;
 
 /*
  * TLV config struct
@@ -118,6 +155,68 @@ esp_err_t esp_secure_cert_get_tlv_info_from_iterator(esp_secure_cert_tlv_iterato
  * brief information about each TLV entry.
  */
 void esp_secure_cert_list_tlv_entries(void);
+
+/**
+ * @brief Initialize the esp_secure_cert partition context.
+ * This function maps the entire esp_secure_cert partition and
+ * populates the context structure with partition information.
+ *
+ * @param[out] ctx Output parameter that will point to the partition context.
+ *                 Pass the address of a pointer variable.
+ *
+ * @return
+ *      - ESP_OK    Successfully mapped partition or already mapped
+ *      - ESP_FAIL  Failed to find or map the partition
+ *
+ * @note If the partition is already mapped, this function returns immediately
+ *       without remapping. This allows safe repeated calls.
+ */
+esp_err_t esp_secure_cert_map_partition(esp_secure_cert_partition_ctx_t **ctx);
+
+/*
+ * Unmap the esp_secure_cert partition to free memory.
+ *
+ * This API is useful for memory-constrained systems where you want to
+ * temporarily free the memory used by the mapped partition when secure
+ * cert operations are not actively needed.
+ *
+ * @note
+ * After calling this function, any subsequent calls to esp_secure_cert APIs
+ * will automatically remap the partition as needed.
+ *
+ * @note
+ * This API is to unmap the partition from the memory. So if any esp_secure_cert API returned pointer(s), those pointers will become invalid after the usage of this API.
+ */
+void esp_secure_cert_unmap_partition(void);
+
+
+/**
+ * @brief Set the esp_secure_cert partition to be used for the next esp_secure_cert operation.
+ *
+ * @param partition The partition to be used for the next esp_secure_cert operation.
+ *
+ * @return ESP_OK on success, otherwise an error code.
+ *
+ * @note
+ * This API, before setting new partition, internally unmaps the previously set partition. So if any esp_secure_cert is called before which had returned pointer(s), those pointers will become invalid after the usage of this API.
+ * User should call again those APIs after setting new partition.
+ */
+esp_err_t esp_secure_cert_tlv_set_partition(const esp_partition_t *partition);
+
+/**
+ * @brief Check the integrity TLV entry and verify partition integrity.
+ *
+ * This API checks if an integrity TLV entry is present in the esp_secure_cert partition.
+ * It finds the integrity TLV entry with the highest subtype and extracts the SHA256 value
+ * from it, then compares it with the calculated SHA256 of the entire partition
+ * (excluding the integrity TLV itself).
+ *
+ * @return
+ *      - ESP_OK    Integrity TLV found and SHA256 verification passed
+ *      - ESP_FAIL  Integrity TLV not found or SHA256 verification failed
+ *      - ESP_ERR_NOT_FOUND Integrity TLV not present in partition
+ */
+esp_err_t esp_secure_cert_verify_partition_integrity(void);
 
 #ifdef __cplusplus
 }

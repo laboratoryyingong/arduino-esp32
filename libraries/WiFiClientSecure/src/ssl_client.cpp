@@ -194,6 +194,14 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
         return handle_error(ret);
     }
 
+#if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
+    // splashme: offer a 4KB max fragment length (RFC 6066). If the server
+    // honours it and CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH is set, the
+    // in/out record buffers shrink to 4KB (~12KB saved per session); servers
+    // that ignore the extension keep full-size buffers - safe either way.
+    mbedtls_ssl_conf_max_frag_len(&ssl_client->ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+#endif
+
     if (alpn_protos != NULL) {
         log_v("Setting ALPN protocols");
         if ((ret = mbedtls_ssl_conf_alpn_protocols(&ssl_client->ssl_conf, alpn_protos) ) != 0) {
@@ -319,6 +327,14 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
         vTaskDelay(2);//2 ticks
     }
 
+
+#if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
+    // splashme: report what the server actually granted - field evidence for
+    // whether the MFL negotiation worked against this broker.
+    log_i("[TLS] negotiated max frag len in=%u out=%u",
+          (unsigned)mbedtls_ssl_get_input_max_frag_len(&ssl_client->ssl_ctx),
+          (unsigned)mbedtls_ssl_get_output_max_frag_len(&ssl_client->ssl_ctx));
+#endif
 
     if (cli_cert != NULL && cli_key != NULL) {
         log_d("Protocol is %s Ciphersuite is %s", mbedtls_ssl_get_version(&ssl_client->ssl_ctx), mbedtls_ssl_get_ciphersuite(&ssl_client->ssl_ctx));

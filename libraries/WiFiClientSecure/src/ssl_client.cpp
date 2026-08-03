@@ -44,6 +44,25 @@ static int _handle_error(int err, const char * function, int line)
 
 #define handle_error(e) _handle_error(e, __FUNCTION__, __LINE__)
 
+/* splashme field diagnostics (see ssl_client.h) */
+splashme_tls_diag_t g_splashme_tls_diag = {0, 0, 0, 0, -1, 0, SPLASHME_TLS_NONE};
+
+static const char *const kSplashmeTlsState[] = {
+    "HELLO_REQUEST", "CLIENT_HELLO", "SERVER_HELLO", "SERVER_CERT",
+    "SERVER_KEY_EXCH", "CERT_REQUEST", "SERVER_HELLO_DONE",
+    "CLIENT_CERT", "CLIENT_KEY_EXCH", "CERT_VERIFY",
+    "CLI_CHANGE_CIPHER", "CLIENT_FINISHED", "SRV_CHANGE_CIPHER",
+    "SERVER_FINISHED", "FLUSH_BUFFERS", "WRAPUP", "OVER",
+    "NEW_SESSION_TICKET", "HELLO_VERIFY_SENT"
+};
+
+const char *splashme_tls_state_name(int state)
+{
+    const int n = (int)(sizeof(kSplashmeTlsState) / sizeof(kSplashmeTlsState[0]));
+    if (state < 0)
+        return "not-started";
+    return (state < n) ? kSplashmeTlsState[state] : "?";
+}
 
 void ssl_init(sslclient_context *ssl_client)
 {
@@ -68,6 +87,16 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
 
     log_v("Starting socket");
     ssl_client->socket = -1;
+
+    // splashme diagnostics: start a fresh record for this attempt.
+    unsigned long splashme_attempt_start = millis();
+    g_splashme_tls_diag.attempts++;
+    g_splashme_tls_diag.tcp_ms = 0;
+    g_splashme_tls_diag.handshake_ms = 0;
+    g_splashme_tls_diag.stall_ms = 0;
+    g_splashme_tls_diag.last_state = -1;
+    g_splashme_tls_diag.last_error = 0;
+    g_splashme_tls_diag.outcome = SPLASHME_TLS_TCP_FAILED; // until TCP is up
 
     // splashme IPv6: resolve and connect via getaddrinfo(AF_UNSPEC) so TLS works
     // on IPv4-only, IPv6-only and dual-stack networks alike (lwIP's resolver
@@ -164,7 +193,9 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
         log_e("connect failed for all resolved addresses of \"%s\"", node);
         return -1;
     }
-    log_i("[TLS] TCP connected to %s (fd %d), starting handshake", node, ssl_client->socket);
+    g_splashme_tls_diag.tcp_ms = millis() - splashme_attempt_start;
+    log_i("[TLS] TCP connected to %s (fd %d) in %lums, starting handshake",
+          node, ssl_client->socket, (unsigned long)g_splashme_tls_diag.tcp_ms);
 
 
 #define ROE(x,msg) { if (((x)<0)) { log_e("LWIP Socket config of " msg " failed."); return -1; }}
@@ -309,8 +340,33 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
 
     log_v("Performing the SSL/TLS handshake...");
     unsigned long handshake_start_time=millis();
+
+    // splashme field diagnostics. The handshake is the one phase that can stall
+    // for minutes on a marginal link while producing NO output at all - the
+    // timeout path below used to simply `return -1`, leaving only a bare
+    // "start_ssl_client: -1" with no clue whether TLS was even reached.
+    // Tracking the mbedTLS state machine turns "the connect was slow" into
+    // "it stalled waiting for X", which distinguishes the real causes:
+    //   SERVER_CERTIFICATE  - the ~4KB cert chain is not getting through, i.e.
+    //                         the link cannot carry bulk inbound data
+    //   CLIENT_KEY_EXCHANGE - our own transmit is not reaching the broker
+    //   CLIENT_HELLO        - nothing flows in either direction
+    // Only slow states are printed, so a healthy handshake stays a single line.
+    const unsigned long kSlowStateMs = 1000; // report a step only if it drags
+
+    int last_state = -1;
+    unsigned long last_state_ms = handshake_start_time;
+
     while ((ret = mbedtls_ssl_handshake(&ssl_client->ssl_ctx)) != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            g_splashme_tls_diag.handshake_ms = millis() - handshake_start_time;
+            g_splashme_tls_diag.stall_ms = millis() - last_state_ms;
+            g_splashme_tls_diag.last_state = last_state;
+            g_splashme_tls_diag.last_error = ret;
+            g_splashme_tls_diag.outcome = SPLASHME_TLS_ERROR;
+            log_e("[TLS] handshake FAILED in %s after %lums (err -0x%04X)",
+                  splashme_tls_state_name(last_state),
+                  millis() - handshake_start_time, -ret);
             // splashme: -9984 (X509 verify failed) is ambiguous - print the
             // verify flags so field logs distinguish a real certificate issue
             // (expired / future / not trusted) from an OOM-mapped failure.
@@ -322,10 +378,37 @@ int start_ssl_client(sslclient_context *ssl_client, const IPAddress& ip, uint32_
             }
             return handle_error(ret);
         }
-        if((millis()-handshake_start_time)>ssl_client->handshake_timeout)
+
+        int st = ssl_client->ssl_ctx.state;
+        if (st != last_state) {
+            unsigned long now = millis();
+            if (last_state >= 0 && (now - last_state_ms) >= kSlowStateMs)
+                log_w("[TLS] slow step: %s took %lums",
+                      splashme_tls_state_name(last_state), now - last_state_ms);
+            last_state = st;
+            last_state_ms = now;
+            g_splashme_tls_diag.last_state = st;
+        }
+
+        if((millis()-handshake_start_time)>ssl_client->handshake_timeout) {
+            g_splashme_tls_diag.handshake_ms = millis() - handshake_start_time;
+            g_splashme_tls_diag.stall_ms = millis() - last_state_ms;
+            g_splashme_tls_diag.last_state = last_state;
+            g_splashme_tls_diag.outcome = SPLASHME_TLS_TIMEOUT;
+            log_e("[TLS] handshake TIMEOUT after %lums - stalled in %s for %lums",
+                  millis() - handshake_start_time,
+                  splashme_tls_state_name(last_state),
+                  millis() - last_state_ms);
             return -1;
+        }
         vTaskDelay(2);//2 ticks
     }
+    g_splashme_tls_diag.handshake_ms = millis() - handshake_start_time;
+    g_splashme_tls_diag.last_state = MBEDTLS_SSL_HANDSHAKE_OVER;
+    g_splashme_tls_diag.stall_ms = 0;
+    g_splashme_tls_diag.last_error = 0;
+    g_splashme_tls_diag.outcome = SPLASHME_TLS_OK;
+    log_i("[TLS] handshake OK in %lums", millis() - handshake_start_time);
 
 
 #if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
